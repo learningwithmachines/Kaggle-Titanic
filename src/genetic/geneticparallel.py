@@ -9,7 +9,7 @@ import gc
 import pickle
 import argparse
 import operator
-from types import LambdaType, FunctionType, ModuleType
+from types import LambdaType, FunctionType
 from typing import Tuple, List, ClassVar, Callable
 import dill
 import numpy as np
@@ -21,7 +21,7 @@ import networkx
 from networkx.drawing.nx_agraph import graphviz_layout
 
 # globals
-gcreator: ModuleType = creator
+gcreator: creator = creator
 gtoolbox: base.Toolbox = base.Toolbox()
 # datafiles
 featuresfile: str = './../../saves/features_data_dict.bin'
@@ -134,10 +134,11 @@ gstats.register("std", np.std)
 gstats.register("min", np.min)
 gstats.register("max", np.max)
 
-def parse_args() -> Tuple[dict, GAData, int, str, dict]:
+
+def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
     '''
     argument parser for GA
-    :return: tuple[dict, GAdata, int, str, dict] needed data for GA construction
+    :return: tuple[dict, object, int, str, Namespace] needed data for GA construction
     '''
     parser: argparse.ArgumentParser = argparse.ArgumentParser('GA Parallel')
 
@@ -185,7 +186,7 @@ def parse_args() -> Tuple[dict, GAData, int, str, dict]:
         :param lambda_: int, number of childrens for mutation
         :param cxpb: float, crossover probability
         :param mutpb: float, mutation probability
-        :param ngen: int, number of generation for eveolution
+        :param ngen: int, number of generation for evolution
         :param stats: tools.support.MultiStatistics, storage object for gp.toolbox
         :param hof: tools.support.HallOfFame, results storage for gp.toolbox, stores best performing functions
         :param verbose: bool, flag
@@ -251,13 +252,18 @@ def parse_args() -> Tuple[dict, GAData, int, str, dict]:
                         help=f'Input Data Dictionary compatible with GAData()\
                             Default is {featuresfile}')
 
+    parser.add_argument('--normalize',
+                        type=bool, default=False,
+                        help=f'Normalize the training data\
+                            Default is {False}')
+
     parser.add_argument('-o', '--ofile',
                         action='store',
                         type=argparse.FileType('wb'), dest='ofile',
-                        default='./../../saves/genetic_function.npy',
+                        default='./../../saves/evolved_genetic_function.npy',
                         help='Wrap the final function to a dictionary as\
                              {"func":func:object} and save to a file in path.\
-                             Default is ./../../saves/genetic_function.npy')
+                             Default is ./../../saves/evolved_genetic_function.npy')
 
     ret_args = parser.parse_args()
     if ret_args.algorithm == 'simple':
@@ -289,20 +295,19 @@ def parse_args() -> Tuple[dict, GAData, int, str, dict]:
                                                  toolbox=gtoolbox)
         algo_tag: str = 'eaMuPlusLambda'
 
-    data: object= GAData(filepath=ret_args.data)
+    data: object= GAData(filepath=ret_args.data, do_norm=ret_args.normalize)
     max_tl: int = ret_args.max_tl
 
-    print(f'Running GA with: {tag}')
+    print(f'Running GA with: {algo_tag}')
     return taskdict, data, max_tl, algo_tag, ret_args
 
 workdict, g_data, g_max_tl, tag, args = parse_args()
 
-# pset
-def getpset(pset_data: GAData = g_data):
+def getpset(pset_data: object = g_data):
     '''
     function for generating primitives for gp.PrimitiveTree
-    :param pset_data: GAData, for renaming of args in accordance with training data features.
-    :return: gp.Primitives, set of primitives to consider for future symbolic operations in GA.
+    :param pset_data: object, GAData, for renaming of args in accordance with training data features.
+    :return: gp.PrimitiveSet, set of primitives to consider for future symbolic operations in GA.
     '''
     p_set = gp.PrimitiveSet('MAIN', arity=pset_data.numfeatures)
     p_set.addPrimitive(np.add, arity=2)
@@ -315,12 +320,12 @@ def getpset(pset_data: GAData = g_data):
     p_set.addPrimitive(np.sin, arity=1)
     p_set.addPrimitive(np.maximum, arity=2)
     p_set.addPrimitive(np.minimum, arity=2)
-    p_set.addEphemeralConstant(f'rand{np.random.randint(1, 1e6)}', lambda: np.random.uniform(-1, 1))
+    p_set.addEphemeralConstant(f'rand{np.random.randint(1, int(1e6))}', lambda: np.random.uniform(-1, 1))
     for cols in pset_data.c_args():
         p_set.renameArguments(**cols)
     return p_set
 # pset instance
-g_pset:  gp.PrimitiveSet = getpset(g_data)
+g_pset: gp.PrimitiveSet = getpset(g_data)
 
 gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
 gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
@@ -330,15 +335,16 @@ gtoolbox.register('population', tools.initRepeat, list, gtoolbox.individual)
 gtoolbox.register('compile', gp.compile, pset=g_pset)
 
 @jit(nogil=True)
-def evaltree(individual: Callable) -> Tuple[float]:
+def evaltree(individual: Callable) -> Tuple[np.float32]:
     '''
     maximizing objective evaluation function
     :param individual: toolbox.individual, single tree with chainable symbols
     :return: tuple[float] maximizing score
     '''
-    func = njit(fastmath=True, nogil=True, parallel=True)(gtoolbox.compile(expr=individual))
+    func = njit(fastmath=True, nogil=True, parallel=True)(gtoolbox.compile(expr=individual, pset=g_pset))
     funcmapped: np.ndarray = jmap(func, g_data.X_train)
-    return tuple(np.sum(np.round(funcmapped) == g_data.Y_train))
+    retval = np.float32(np.sum(np.round(funcmapped) == g_data.Y_train))
+    return retval,
 
 
 gtoolbox.register('evaluate', evaltree)
@@ -354,10 +360,12 @@ ghistory = tools.History()
 gtoolbox.decorate("mate", ghistory.decorator)
 gtoolbox.decorate("mutate", ghistory.decorator)
 
+workdict['population'] = gtoolbox.population(n=workdict['population'])
+
 def plot_records(logbook: dict) -> np.ndarray:
     '''
-    plotting function for GA evolaution
-    :param logbook: dict, dictionary of statistics, heirarchically grouped by keywords
+    plotting function for GA evolution
+    :param logbook: dict, dictionary of statistics, hierarchically grouped by keywords
     :return: ndarray, 3-channel RGB array from plot
     '''
     gens = logbook.select('gen')
@@ -421,7 +429,6 @@ if __name__ == '__main__':
     pool = pt.multiprocessing.ProcessingPool(nodes=8)
 
     # actual work
-    workdict['population'] = gtoolbox.population(n=workdict['population'])
     workdict['toolbox'].register('map', pool.map)
     ghistory.update(workdict['population'])
     gc.collect()
@@ -444,7 +451,7 @@ if __name__ == '__main__':
 
     if args.test:
         with open(args.ofile.name, 'rb') as ifile:
-            refunc = pickle.load(ifile)
+            refunc: dict = pickle.load(ifile)
             ifile.close()
         if isinstance(refunc, dict) and isinstance(refunc['func'], LambdaType):
             print(f'File correctly reloaded, testing for output..')
