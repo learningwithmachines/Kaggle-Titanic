@@ -1,9 +1,13 @@
 '''
-Implementation of symbolic classifier using genetic algorithms based off of the DEAP Library.
-Available deap algorithms are eaSimple and eaMuPlusLambda.
-Parallelized through Pathos-ProcessPool(with Dill) and Numba.
-Uses recommended StaticLimits on heights(=17) and DoubleTournaments for bloat control.
-CLI-based with argparse, saves best result with fitness and genealogy plots to file.
+* Implementation of symbolic classifier using genetic algorithms based off
+  of the DEAP Library.
+    ** Available deap algorithms are eaSimple and eaMuPlusLambda.
+    ** Parallelized through Pathos-ProcessPool(with Dill) and Numba.
+    ** Uses recommended StaticLimits on heights(=17) and DoubleTournaments
+       for bloat control.
+* CLI-based with argparse, saves best result with fitness and genealogy plots to file.
+    ** Can also optionally resume training from the terminal-populations of 
+       a previously saved *_state* file via the *resume* and *seedfile* parameter.
 '''
 import gc
 import pickle
@@ -120,6 +124,9 @@ def safediv(l: float, r: float) -> float:
         return 1
     return l / r
 
+# creator classes
+gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
+gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
 # best logger
 ghof: tools.support.HallOfFame = tools.HallOfFame(1)
 # fitness logger
@@ -202,7 +209,7 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                   ngen, stats, hof, verbose]
         return dict(zip(keys, values))
 
-    parser.add_argument('PopSize', help='Starting Population Size', type=int, default=50)
+    parser.add_argument('PopSize', help='Starting Population Size, discarded if resuming', type=int, default=50)
 
     parser.add_argument('Numgens', help='Number of Generations', type=int, default=10)
 
@@ -253,14 +260,31 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                             Default is {featuresfile}')
 
     parser.add_argument('--normalize',
-                        type=bool, default=False,
+                        type=bool, default=True,
                         help=f'Normalize the training data\
+                            Default is {True}')
+
+    parser.add_argument('--resume',
+                        action='store_true', default=False,
+                        help=f'Resume training from a previous run,\
+                            Will overwrite the starting population from\
+                            saved populations of an existing savefile,\
+                            provided by the seedfile argument.\
+                            Default is {False}')
+
+    parser.add_argument('-sf', '--seedfile',
+                        action='store', type=argparse.FileType('rb'),
+                        dest='seedfile', default=None,
+                        help=f'Resume training from a previous run,\
+                            Will overwrite the starting population from\
+                            saved populations of an existing savefile,\
+                            provided by the seedfile argument.\
                             Default is {False}')
 
     parser.add_argument('-o', '--ofile',
                         action='store',
                         type=argparse.FileType('wb'), dest='ofile',
-                        default='./../../saves/evolved_genetic_function.npy',
+                        default='./../../saves/evolved_genfunc.npy',
                         help='Wrap the final function to a dictionary as\
                              {"func":func:object} and save to a file in path.\
                              Default is ./../../saves/evolved_genetic_function.npy')
@@ -320,15 +344,13 @@ def getpset(pset_data: object = g_data):
     p_set.addPrimitive(np.sin, arity=1)
     p_set.addPrimitive(np.maximum, arity=2)
     p_set.addPrimitive(np.minimum, arity=2)
-    p_set.addEphemeralConstant(f'rand{np.random.randint(1, int(1e6))}', lambda: np.random.uniform(-1, 1))
+    p_set.addEphemeralConstant(f'rand', lambda: np.random.uniform(-1, 1))
     for cols in pset_data.c_args():
         p_set.renameArguments(**cols)
     return p_set
 # pset instance
 g_pset: gp.PrimitiveSet = getpset(g_data)
 
-gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
-gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
 gtoolbox.register('expr', gp.genHalfAndHalf, pset=g_pset, min_=1, max_=g_max_tl)
 gtoolbox.register('individual', tools.initIterate, gcreator.Individual, gtoolbox.expr)
 gtoolbox.register('population', tools.initRepeat, list, gtoolbox.individual)
@@ -360,7 +382,19 @@ ghistory = tools.History()
 gtoolbox.decorate("mate", ghistory.decorator)
 gtoolbox.decorate("mutate", ghistory.decorator)
 
-workdict['population'] = gtoolbox.population(n=workdict['population'])
+# initiate population
+print(f'resume: {args.resume}, seedfile status: {args.seedfile}')
+if args.resume:
+    if args.seedfile is not None:
+        try:
+            seedfile: dict = pickle.load(args.seedfile)
+        except FileNotFoundError as fnf:
+            print(fnf)
+        else:
+            workdict['population'] = seedfile['all_pops']
+            print('Successfully loaded populations from seedfile!')
+else:
+    workdict['population'] = gtoolbox.population(n=workdict['population'])
 
 def plot_records(logbook: dict) -> np.ndarray:
     '''
@@ -407,7 +441,11 @@ def genealogy_plot(history: tools.support.History, toolbox: base.Toolbox) -> np.
     graph = graph.reverse()  # Make the graph top-down
 
     fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
-    colors = [toolbox.evaluate(history.genealogy_history[i])[0] for i in graph]
+    try:
+        colors = [toolbox.evaluate(history.genealogy_history[i])[0] for i in graph]
+    except:
+        # catch all for failures
+        colors = [i for i in range(history.genealogy_index)]
     positions = graphviz_layout(graph, prog="dot")
     networkx.draw(graph, positions, node_color=colors,
                   with_labels=True,
@@ -420,6 +458,21 @@ def genealogy_plot(history: tools.support.History, toolbox: base.Toolbox) -> np.
     image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
     plt.close(fig)
     return image
+
+# saving the population state in the same file as the other non-dependent
+# parameters like the final function/lambda and plots will lead to a
+# deserialization failure / pickling problem unless the entire
+# toolbox and creator classes are re-instantiated and made available
+# in the scope, so we just save the population states into a separate file.
+def append_savefile(filename: str, toappend: str='_saved_state') -> str:
+    '''
+    creates name for the population states file
+    :param filename: name of the main save file from the args.ofile parameter
+    :param toappend: the string to append as a suffix onto the ofile string
+    :return: the final string to be used for population states file.
+    '''
+    sep_pos: int = filename.rfind('.')
+    return filename[:sep_pos]+toappend+filename[sep_pos:]
 
 
 if __name__ == '__main__':
@@ -444,9 +497,14 @@ if __name__ == '__main__':
     tosave = {'func': gtoolbox.compile(expr=workdict['halloffame'][0]),
               'plot': plot_image,
               'history': plot_genealogy}
+    to_state = {'all_pops': pop,
+                'history': ghistory}
     print(str(workdict['halloffame'][0]))
     dill.dump(tosave, args.ofile, protocol=-1)
     args.ofile.close()
+    with open(append_savefile(args.ofile.name), 'wb') as state_file:
+        dill.dump(to_state, state_file, protocol=-1)
+        state_file.close()
     print(f'file written as dict object to {args.ofile.name}')
 
     if args.test:
