@@ -9,12 +9,13 @@
     ** Can also optionally resume training from the terminal-populations of 
        a previously saved *_state* file via the *resume* and *seedfile* parameter.
 '''
+import sys
 import gc
 import pickle
 import argparse
 import operator
 from types import LambdaType, FunctionType
-from typing import Tuple, List, ClassVar, Callable
+from typing import Tuple, Callable
 import dill
 import numpy as np
 from numba import jit, njit, float32, float64
@@ -23,6 +24,8 @@ import pathos as pt
 import matplotlib.pyplot as plt
 import networkx
 from networkx.drawing.nx_agraph import graphviz_layout
+sys.path.append('../')
+from data_utils.gadata import GAData
 
 # globals
 gcreator: creator = creator
@@ -31,75 +34,6 @@ gtoolbox: base.Toolbox = base.Toolbox()
 featuresfile: str = './../../saves/features_data_dict.bin'
 augdatafile: str = './../../saves/augmented_data_dict.bin'
 
-# custom dataclass, loads data from a dictionary of numpy arrays and column labels
-class GAData:
-    '''
-    Class object to store data, properties and methods needed for GA.
-    '''
-    def __init__(self, filepath: str, do_norm: bool=False) -> None:
-        '''
-        initialize GAData by loading, perform optionally normalize and cast data to float
-        :param filepath: str, location of pre-pickled & compatible data dictionary
-        :param do_norm: Bool, flag to perform np.linalg norm on train and test features.
-        '''
-        self.X_train, self.Y_train, self.X_test, self.features = self.load_dict(filepath)
-        renorm: np.float64 = np.linalg.norm(np.vstack([self.X_train, self.X_test]))
-
-        if do_norm:
-            self.X_train = self.X_train.astype(np.float64) / renorm
-            self.X_test = self.X_test.astype(np.float64) / renorm
-
-        self.X_train: ClassVar = self.X_train.astype(np.float32)
-        self.X_test: ClassVar = self.X_test.astype(np.float32)
-        self.Y_train: ClassVar = self.Y_train.reshape(-1)
-        self.features: ClassVar = tuple(self.features)
-
-    @staticmethod
-    def load_dict(filepath:str)->Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-        '''
-        method to load pickled data and unpack, and return values to class
-        :param filepath: str, location of pre-pickled & compatible data dictionary
-        :return: tuple[ndarray, ndarray, ndarray, list[str,]]
-        '''
-        with open(filepath, 'rb') as pfile:
-            datafile = pickle.load(file=pfile)
-            pfile.close()
-
-        return datafile['X_train'], datafile['Y_train'], datafile['X_test'], datafile['features']
-
-    @property
-    def training_size(self) -> int:
-        '''
-        shape of training data
-        :return: int
-        '''
-        return self.X_train.shape[0]
-
-    @property
-    def testing_size(self) -> int:
-        '''
-        shape of testing data
-        :return: int
-        '''
-        return self.X_test.shape[0]
-
-    @property
-    def numfeatures(self) -> int:
-        '''
-        number of feature columns in training data
-        :return: int
-        '''
-        return self.X_train.shape[1]
-
-    def c_args(self) -> List[dict]:
-        '''
-        make **kwarg pairs from featurenames for pset renaming
-        :return: list[dict]
-        '''
-        return [{f'ARG{ix}': name} for ix, name in enumerate(self.features)]
-
-# dataclass instance, for testing
-# data = GAData(filepath=featuresfile)
 
 def jmap(func: FunctionType, array: np.ndarray) -> np.ndarray:
     '''
@@ -109,6 +43,7 @@ def jmap(func: FunctionType, array: np.ndarray) -> np.ndarray:
     :return: ndarray, func mapped array
     '''
     return np.array(tuple(func(*tuple(float(x) for x in subarray)) for subarray in array), dtype=np.float32)
+
 
 # additional primitive
 @njit([float32(float32, float32),
@@ -123,6 +58,7 @@ def safediv(l: float, r: float) -> float:
     if r == 0.0:
         return 1
     return l / r
+
 
 # creator classes
 gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
@@ -160,6 +96,7 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
             raise parser.error(f"max_tl must be between 1 and 17, passed value: {x}")
         return x
 
+
     def get_easimple_args(popsize: int, cxpb: float,
                           mutpb: float, ngen: int, stats: tools.support.MultiStatistics,
                           hof: tools.support.HallOfFame, verbose: bool,
@@ -181,6 +118,7 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
         values = [popsize, toolbox, cxpb,
                   mutpb, ngen, stats, hof, verbose]
         return dict(zip(keys, values))
+
 
     def get_eamupluslambda_args(popsize: int, mu: int, lambda_: int,
                                 cxpb: float, mutpb: float, ngen: int,
@@ -208,6 +146,7 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                   lambda_, cxpb, mutpb,
                   ngen, stats, hof, verbose]
         return dict(zip(keys, values))
+
 
     parser.add_argument('PopSize', help='Starting Population Size, discarded if resuming.\
                         \n Default is 50.',
@@ -344,7 +283,10 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
     print(f'Running GA with: {algo_tag}')
     return taskdict, data, max_tl, algo_tag, ret_args
 
+
+
 workdict, g_data, g_max_tl, tag, args = parse_args()
+
 
 def getpset(pset_data: object = g_data):
     '''
@@ -375,10 +317,12 @@ gtoolbox.register('individual', tools.initIterate, gcreator.Individual, gtoolbox
 gtoolbox.register('population', tools.initRepeat, list, gtoolbox.individual)
 gtoolbox.register('compile', gp.compile, pset=g_pset)
 
+
 @njit(fastmath=True, nogil=True, parallel=True)
 def accuracy_score(ytrue: np.ndarray, yhat: np.ndarray) -> np.float32:
     ysig = (1e-15 + (1 / (1 + np.exp(-yhat)))) > 0.5
     return np.float32(np.sum(ytrue == ysig))
+
 
 @jit(nogil=True)
 def evaltree(individual: Callable) -> Tuple[np.float32]:
@@ -420,6 +364,7 @@ if args.resume:
 else:
     workdict['population'] = gtoolbox.population(n=workdict['population'])
 
+
 def plot_records(logbook: dict) -> np.ndarray:
     '''
     plotting function for GA evolution
@@ -454,6 +399,7 @@ def plot_records(logbook: dict) -> np.ndarray:
     plt.close(fig)
     return image
 
+
 def genealogy_plot(history: tools.support.History, toolbox: base.Toolbox) -> np.ndarray:
     '''
     plotting function for genealogical history of the GA run.
@@ -483,6 +429,7 @@ def genealogy_plot(history: tools.support.History, toolbox: base.Toolbox) -> np.
     plt.close(fig)
     return image
 
+
 # saving the population state in the same file as the other non-dependent
 # parameters like the final function/lambda and plots will lead to a
 # deserialization failure / pickling problem unless the entire
@@ -499,8 +446,7 @@ def append_savefile(filename: str, toappend: str='_saved_state') -> str:
     return filename[:sep_pos]+toappend+filename[sep_pos:]
 
 
-if __name__ == '__main__':
-
+def main():
     # pool
     gc.collect()
     pool = pt.multiprocessing.ProcessingPool(nodes=8)
@@ -541,3 +487,7 @@ if __name__ == '__main__':
             temp = f"OK, output: {temp:.2f} is a float" if isinstance(temp, float) \
                 else f"Error!, Lambda produced output of type {str(type(temp))}"
             print(f'{temp}')
+
+
+if __name__ == '__main__':
+    main()
