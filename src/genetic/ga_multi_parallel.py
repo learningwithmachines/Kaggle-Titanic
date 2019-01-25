@@ -1,12 +1,13 @@
 '''
 * Implementation of symbolic classifier using genetic algorithms based off
   of the DEAP Library.
+    ** Multiple Objectives Version. [abs_accuracy + cross_entropy]
     ** Available deap algorithms are eaSimple and eaMuPlusLambda.
     ** Parallelized through Pathos-ProcessPool(with Dill) and Numba.
-    ** Uses recommended StaticLimits on heights(=17) and DoubleTournaments
+    ** Uses recommended StaticLimits on heights(=17) and NSGA2/SPEA2 selection
        for bloat control.
 * CLI-based with argparse, saves best result with fitness and genealogy plots to file.
-    ** Can also optionally resume training from the terminal-populations of 
+    ** Can also optionally resume training from the terminal-populations of
        a previously saved *_state* file via the *resume* and *seedfile* parameter.
 '''
 import gc
@@ -125,15 +126,17 @@ def safediv(l: float, r: float) -> float:
     return l / r
 
 # creator classes
-gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
-gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
+gcreator.create('FitnessMULTI', base.Fitness, weights=(1.0, -1.0,))
+gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMULTI)
 # best logger
 ghof: tools.support.HallOfFame = tools.HallOfFame(1)
 # fitness logger
-g_fit: tools.support.Statistics = tools.Statistics(lambda ind: ind.fitness.values)
+g_fit0: tools.support.Statistics = tools.Statistics(lambda ind: ind.fitness.values[0])
+g_fit1: tools.support.Statistics = tools.Statistics(lambda ind: ind.fitness.values[1])
 g_len: tools.support.Statistics = tools.Statistics(len)
 g_height: tools.support.Statistics = tools.Statistics(operator.attrgetter('height'))
-gstats: tools.support.MultiStatistics = tools.MultiStatistics(fitness=g_fit,
+gstats: tools.support.MultiStatistics = tools.MultiStatistics(accuracy=g_fit0,
+                                                              cross_entropy=g_fit1,
                                                               length=g_len,
                                                               height=g_height)
 gstats.register("avg", np.mean)
@@ -209,46 +212,55 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                   ngen, stats, hof, verbose]
         return dict(zip(keys, values))
 
-    parser.add_argument('PopSize', help='Starting Population Size, discarded if resuming', type=int, default=50)
+    parser.add_argument('PopSize', help='Starting Population Size, discarded if resuming.\n Default is 50.', type=int, default=50)
 
-    parser.add_argument('Numgens', help='Number of Generations', type=int, default=10)
+    parser.add_argument('Numgens', help='Number of Generations.\n Default is 10.', type=int, default=10)
 
     parser.add_argument('--cxpb',
-                        help='The probability that an offspring is produced by crossover.',
+                        help='The probability that an offspring is produced by crossover.\n Default is 0.25.',
                         type=float, default=0.25)
 
     parser.add_argument('--mutpb',
-                        help='The probability that an offspring is produced by mutation.',
+                        help='The probability that an offspring is produced by mutation.\n Default is 0.5.',
                         type=float, default=0.5)
 
     parser.add_argument('--mu',
-                        help='The number of individuals to select for the next generation, does not apply to eaSimple.',
+                        help='The number of individuals to select for the next generation,\
+                         does not apply to eaSimple.\n Default is equal to the Population Size Argument.',
                         type=int, default=False)
 
-
-
     parser.add_argument('--lambda_',
-                        help='The number of children to produce at each generation, does not apply to eaSimple.',
+                        help='The number of children to produce at each generation,\
+                         does not apply to .\n Default is twice the Population Size Argument.',
                         type=int, default=False)
 
     parser.add_argument('--max_tl',
-                        help='The maximum height of the tree to construct for gp.PrimitiveTree,\
-                             default is 11. Maximum is 17.',
+                        help='The maximum height of the tree to construct for gp.PrimitiveTree.\
+                             \n Default is 11, Maximum is 17.',
                         type=type_max_tl,
                         default=11)
 
     parser.add_argument('--algorithm',
                         type=str,
-                        help='Choice of Evolutionary Algorithm',
+                        help='Choice of Evolutionary Algorithm, options are "simple" for eaSimple and\
+                            \n"mupluslambda" for eaMuPlusLambda.\n Default is "simple".',
                         default='simple',
                         choices=['simple', 'mupluslambda'])
 
+    parser.add_argument('--selector',
+                        type=str,
+                        help='Choice of Multi-Objective Selection Algorithm, Options are:\
+                         "nsga" for NSGA-II and "spea" for SPEA-II.\n Default is "nsga"/NSGA-II.',
+                        default='nsga',
+                        choices=['nsga', 'spea'])
+
     parser.add_argument('--verbose',
-                        help='output verbosity',
+                        help='output verbosity.\n Default is True.',
                         action='store_true')
 
     parser.add_argument('--test',
-                        help='reload and test generated function on a random input',
+                        help='reload and test the generated function on a random input.\
+                        \n Default is True.',
                         default=True,
                         action='store_true')
 
@@ -257,37 +269,37 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                         type=str, dest='data',
                         default=featuresfile,
                         help=f'Input Data Dictionary compatible with GAData()\
-                            Default is {featuresfile}')
+                        \n Default is {featuresfile}.')
 
     parser.add_argument('--normalize',
                         type=bool, default=True,
-                        help=f'Normalize the training data\
-                            Default is {True}')
+                        help='Normalize the training data.\
+                        \n Default is True.')
 
     parser.add_argument('--resume',
                         action='store_true', default=False,
-                        help=f'Resume training from a previous run,\
-                            Will overwrite the starting population from\
-                            saved populations of an existing savefile,\
-                            provided by the seedfile argument.\
-                            Default is {False}')
+                        help='Resume training from a previous run,\
+                        Will overwrite the starting population from\
+                        saved populations of an existing savefile,\
+                        provided by the seedfile argument.\
+                        \n Default is False.')
 
     parser.add_argument('-sf', '--seedfile',
                         action='store', type=argparse.FileType('rb'),
                         dest='seedfile', default=None,
-                        help=f'Resume training from a previous run,\
-                            Will overwrite the starting population from\
-                            saved populations of an existing savefile,\
-                            provided by the seedfile argument.\
-                            Default is {False}')
+                        help='Resume training from a previous run,\
+                        Will overwrite the starting population from\
+                        saved populations of an existing savefile,\
+                        provided by the seedfile argument.\
+                        \n Default is False.')
 
     parser.add_argument('-o', '--ofile',
                         action='store',
                         type=argparse.FileType('wb'), dest='ofile',
-                        default='./../../saves/evolved_genfunc.npy',
+                        default='./../../saves/evolved_multi_genetic_function.npy',
                         help='Wrap the final function to a dictionary as\
-                             {"func":func:object} and save to a file in path.\
-                             Default is ./../../saves/evolved_genetic_function.npy')
+                        {"func":func:object} and save to a file in path.\
+                        \n Default is ./../../saves/evolved_multi_genetic_function.npy.')
 
     ret_args = parser.parse_args()
     if ret_args.algorithm == 'simple':
@@ -356,8 +368,19 @@ gtoolbox.register('individual', tools.initIterate, gcreator.Individual, gtoolbox
 gtoolbox.register('population', tools.initRepeat, list, gtoolbox.individual)
 gtoolbox.register('compile', gp.compile, pset=g_pset)
 
-@jit(nogil=True)
-def evaltree(individual: Callable) -> Tuple[np.float32]:
+@njit(fastmath=True, nogil=True, parallel=True)
+def accuracy_score(ytrue: np.ndarray, yhat: np.ndarray) -> np.float32:
+    ysig = (1e-15 + (1 / (1 + np.exp(-yhat)))) > 0.5
+    return np.float32(np.sum(ytrue == ysig))
+
+
+@njit(fastmath=True, nogil=True, parallel=True)
+def nbnp_ce(ytrue, yhat):
+    ysig = 1e-15 + (1 / (1 + np.exp(-yhat)))
+    return -1/len(ytrue) * (np.sum(ytrue*np.log(ysig) + (1-ytrue)*np.log(1-ysig)))
+
+
+def evaltree(individual: Callable) -> Tuple[np.float32, np.float32]:
     '''
     maximizing objective evaluation function
     :param individual: toolbox.individual, single tree with chainable symbols
@@ -365,12 +388,13 @@ def evaltree(individual: Callable) -> Tuple[np.float32]:
     '''
     func = njit(fastmath=True, nogil=True, parallel=True)(gtoolbox.compile(expr=individual, pset=g_pset))
     funcmapped: np.ndarray = jmap(func, g_data.X_train)
-    retval = np.float32(np.sum(np.round(funcmapped) == g_data.Y_train))
-    return retval,
+    accuracy = accuracy_score(g_data.Y_train, funcmapped)
+    loss = nbnp_ce(g_data.Y_train, funcmapped)
+    return accuracy, loss,
 
 
 gtoolbox.register('evaluate', evaltree)
-gtoolbox.register('select', tools.selDoubleTournament, fitness_size=6, parsimony_size=1.6, fitness_first=True)
+gtoolbox.register('select', tools.selSPEA2 if args.selector == 'spea' else tools.selNSGA2)
 gtoolbox.register('mate', gp.cxOnePoint)
 gtoolbox.register('expr_mut', gp.genFull, min_=0, max_=17)
 gtoolbox.register('mutate', gp.mutUniform, expr=gtoolbox.expr_mut, pset=g_pset)
@@ -396,19 +420,19 @@ if args.resume:
 else:
     workdict['population'] = gtoolbox.population(n=workdict['population'])
 
-def plot_records(logbook: dict) -> np.ndarray:
+def plot_records(logbook: dict, xdata: object=g_data ) -> np.ndarray:
     '''
     plotting function for GA evolution
     :param logbook: dict, dictionary of statistics, hierarchically grouped by keywords
     :return: ndarray, 3-channel RGB array from plot
     '''
     gens = logbook.select('gen')
-    fit_maxs = logbook.chapters['fitness'].select('max')
-    fit_avgs = logbook.chapters['fitness'].select('avg')
+    acc_avgs = np.array(logbook.chapters['accuracy'].select('avg')) / g_data.training_size
+    ce_avgs = logbook.chapters['cross_entropy'].select('avg')
     size_avgs = logbook.chapters['length'].select('avg')
     fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
-    line1 = ax.plot(gens, fit_maxs, 'b-', label='Maximum Fitness')
-    line2 = ax.plot(gens, fit_avgs, 'b-', label='Average Fitness', linestyle=':')
+    line1 = ax.plot(gens, acc_avgs, 'b-', label='Average Fitness 0: ACC')
+    line2 = ax.plot(gens, ce_avgs, 'b-', label='Average Fitness 1: BCE', linestyle=':')
     ax.set_xlabel('Generation')
     ax.set_ylabel('Fitness', color='b')
     for tl in ax.get_yticklabels():
