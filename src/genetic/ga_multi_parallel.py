@@ -11,6 +11,8 @@
        a previously saved *_state* file via the *resume* and *seedfile* parameter.
 '''
 import sys
+sys.path.append('../')
+from data_utils.gadata import GAData
 import gc
 import pickle
 import argparse
@@ -25,8 +27,6 @@ import pathos as pt
 import matplotlib.pyplot as plt
 import networkx
 from networkx.drawing.nx_agraph import graphviz_layout
-sys.path.append('../')
-from data_utils.gadata import GAData
 
 # globals
 gcreator: creator = creator
@@ -370,7 +370,7 @@ def plot_records(logbook: dict, xdata: object=g_data ) -> np.ndarray:
     :return: ndarray, 3-channel RGB array from plot
     '''
     gens = logbook.select('gen')
-    acc_avgs = np.array(logbook.chapters['accuracy'].select('avg')) / g_data.training_size
+    acc_avgs = np.array(logbook.chapters['accuracy'].select('avg')) / xdata.training_size
     ce_avgs = logbook.chapters['cross_entropy'].select('avg')
     size_avgs = logbook.chapters['length'].select('avg')
     fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
@@ -411,9 +411,9 @@ def genealogy_plot(history: tools.support.History, toolbox: base.Toolbox) -> np.
     fig, ax = plt.subplots(figsize=(8, 6), dpi=120)
     try:
         colors = [toolbox.evaluate(history.genealogy_history[i])[0] for i in graph]
-    except:
-        # catch all for failures
+    except: # catch all for failures
         colors = [i for i in range(history.genealogy_index)]
+
     positions = graphviz_layout(graph, prog="dot")
     networkx.draw(graph, positions, node_color=colors,
                   with_labels=True,
