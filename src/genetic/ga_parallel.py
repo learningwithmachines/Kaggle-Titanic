@@ -72,10 +72,15 @@ g_height: tools.support.Statistics = tools.Statistics(operator.attrgetter('heigh
 gstats: tools.support.MultiStatistics = tools.MultiStatistics(fitness=g_fit,
                                                               length=g_len,
                                                               height=g_height)
-gstats.register("avg", np.mean)
-gstats.register("std", np.std)
-gstats.register("min", np.min)
-gstats.register("max", np.max)
+rmean = lambda x: np.mean(x).round(2)
+rstd = lambda x: np.std(x).round(2)
+rmin = lambda x: np.min(x).round(2)
+rmax = lambda x: np.max(x).round(2)
+
+gstats.register("avg", rmean)
+gstats.register("std", rstd)
+gstats.register("min", rmin)
+gstats.register("max", rmax)
 
 
 def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
@@ -179,7 +184,8 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
 
     parser.add_argument('--lambda_',
                         help='The number of children to produce at each generation,\
-                             does not apply to .\n Default is twice the Population Size Argument.',
+                             does not apply to eaSimple.\
+                             \n Default is twice the Population Size Argument.',
                         type=int,
                         default=False)
 
