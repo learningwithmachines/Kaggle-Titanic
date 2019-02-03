@@ -46,21 +46,6 @@ def jmap(func: FunctionType, array: np.ndarray) -> np.ndarray:
     return np.array(tuple(func(*tuple(float(x) for x in subarray)) for subarray in array), dtype=np.float32)
 
 
-# additional primitive
-@njit([float32(float32, float32),
-       float64(float64, float64)])
-def safediv(l: float, r: float) -> float:
-    '''
-    zero protected division
-    :param l: float, int
-    :param r: float, int
-    :return: float
-    '''
-    if r == 0.0:
-        return 1
-    return l / r
-
-
 # creator classes
 gcreator.create('FitnessMULTI', base.Fitness, weights=(1.0, -1.0,))
 gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMULTI)
@@ -76,10 +61,10 @@ gstats: tools.support.MultiStatistics = tools.MultiStatistics(accuracy=g_fit0,
                                                               length=g_len,
                                                               height=g_height)
 
-rmean = lambda x: np.mean(x).round(2)
-rstd = lambda x: np.std(x).round(2)
-rmin = lambda x: np.min(x).round(2)
-rmax = lambda x: np.max(x).round(2)
+rmean = lambda x: np.nanmean(x).round(2)
+rstd = lambda x: np.nanstd(x).round(2)
+rmin = lambda x: np.min(np.where(np.isnan(x), np.inf, x)).round(2)
+rmax = lambda x: np.max(np.where(np.isnan(x), np.inf, x)).round(2)
 
 gstats.register("avg", rmean)
 gstats.register("std", rstd)
@@ -277,13 +262,13 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
         algo_tag: str = 'eaMuPlusLambda'
 
     data: object= GAData(filepath=ret_args.data, do_norm=ret_args.normalize)
-    max_tl: int = ret_args.max_tl
 
     print(f'Running GA with: {algo_tag}')
-    return taskdict, data, max_tl, algo_tag, ret_args
+    return taskdict, data, algo_tag, ret_args
 
 
-workdict, g_data, g_max_tl, tag, args = parse_args()
+workdict, g_data, tag, args = parse_args()
+g_max_tl: int = args.max_tl
 
 
 def getpset(pset_data: object = g_data):
@@ -292,18 +277,59 @@ def getpset(pset_data: object = g_data):
     :param pset_data: object, GAData, for renaming of args in accordance with training data features.
     :return: gp.PrimitiveSet, set of primitives to consider for future symbolic operations in GA.
     '''
-    p_set = gp.PrimitiveSet('MAIN', arity=pset_data.numfeatures)
-    p_set.addPrimitive(np.add, arity=2)
-    p_set.addPrimitive(np.subtract, arity=2)
-    p_set.addPrimitive(np.multiply, arity=2)
-    p_set.addPrimitive(safediv, arity=2)
-    p_set.addPrimitive(np.negative, arity=1)
-    p_set.addPrimitive(np.tanh, arity=1)
-    p_set.addPrimitive(np.cos, arity=1)
-    p_set.addPrimitive(np.sin, arity=1)
-    p_set.addPrimitive(np.maximum, arity=2)
-    p_set.addPrimitive(np.minimum, arity=2)
-    p_set.addEphemeralConstant(f'rand', lambda: np.random.uniform(-1, 1))
+    p_set = gp.PrimitiveSetTyped('MAIN', tuple(repeat(float, g_data.numfeatures)), float)
+
+    # boolean ops
+    p_set.addPrimitive(np.logical_and, (bool, bool), bool)
+    p_set.addPrimitive(np.logical_or, (bool, bool), bool)
+    p_set.addPrimitive(np.logical_not, (bool,), bool)
+
+    # logical ops
+    # custom primitive
+    @njit([float32(boolean, float32, float32),
+           float64(boolean, float64, float64)],
+          nogil=True, parallel=True)
+    def ifte(input: bool, out1: float, out2: float) -> float:
+        if input:
+            return out1
+        else:
+            return out2
+
+    p_set.addPrimitive(np.less, (float, float), bool)
+    p_set.addPrimitive(np.equal, (float, float), bool)
+    p_set.addPrimitive(ifte, (float, float), bool)
+
+    # flops
+    # custom primitive
+    @njit([float32(float32, float32),
+           float64(float64, float64)],
+          nogil=True, parallel=True)
+    def safediv(l: float, r: float) -> float:
+        '''
+        zero protected division
+        :param l: float, int
+        :param r: float, int
+        :return: float
+        '''
+        if r == 0.0:
+            return 1
+        return l / r
+
+    p_set.addPrimitive(np.add, (float, float), float)
+    p_set.addPrimitive(np.subtract, (float, float), float)
+    p_set.addPrimitive(np.multiply, (float, float), float)
+    p_set.addPrimitive(safediv, (float, float), float)
+    p_set.addPrimitive(np.negative, (float,), float)
+    p_set.addPrimitive(np.tanh, (float,), float)
+    p_set.addPrimitive(np.cos, (float,), float)
+    p_set.addPrimitive(np.sin, (float,), float)
+    p_set.addPrimitive(np.maximum, (float, float), float)
+    p_set.addPrimitive(np.minimum, (float, float), float)
+
+    # terminals
+    p_set.addEphemeralConstant(f'rand', lambda: np.random.uniform(-1, 1), float)
+    p_set.addTerminal(False, bool)
+    p_set.addTerminal(True, bool)
     for cols in pset_data.c_args():
         p_set.renameArguments(**cols)
     return p_set
@@ -324,7 +350,7 @@ def accuracy_score(ytrue: np.ndarray, yhat: np.ndarray) -> np.float32:
 
 @njit(fastmath=True, nogil=True, parallel=True)
 def nbnp_ce(ytrue, yhat):
-    ysig = 1e-15 + (1 / (1 + np.exp(-yhat)))
+    ysig = np.where(yhat >= 0, 1 / (1 + np.exp(-yhat)), np.exp(yhat) / (1 + np.exp(yhat)))
     return -1/len(ytrue) * (np.sum(ytrue*np.log(ysig) + (1-ytrue)*np.log(1-ysig)))
 
 

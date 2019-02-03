@@ -17,10 +17,11 @@ import operator
 from types import LambdaType, FunctionType
 from typing import Tuple, Callable
 import dill
+from itertools import repeat
 import numpy as np
-from numba import jit, njit, float32, float64
+from numba import jit, njit, float32, float64, boolean
 from deap import base, creator, tools, gp, algorithms
-import pathos as pt
+from pathos import multiprocessing as mp
 import matplotlib.pyplot as plt
 import networkx
 from networkx.drawing.nx_agraph import graphviz_layout
@@ -45,24 +46,6 @@ def jmap(func: FunctionType, array: np.ndarray) -> np.ndarray:
     return np.array(tuple(func(*tuple(float(x) for x in subarray)) for subarray in array), dtype=np.float32)
 
 
-# additional primitive
-@njit([float32(float32, float32),
-       float64(float64, float64)])
-def safediv(l: float, r: float) -> float:
-    '''
-    zero protected division
-    :param l: float, int
-    :param r: float, int
-    :return: float
-    '''
-    if r == 0.0:
-        return 1
-    return l / r
-
-
-# creator classes
-gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
-gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
 # best logger
 ghof: tools.support.HallOfFame = tools.HallOfFame(1)
 # fitness logger
@@ -72,10 +55,11 @@ g_height: tools.support.Statistics = tools.Statistics(operator.attrgetter('heigh
 gstats: tools.support.MultiStatistics = tools.MultiStatistics(fitness=g_fit,
                                                               length=g_len,
                                                               height=g_height)
-rmean = lambda x: np.mean(x).round(2)
-rstd = lambda x: np.std(x).round(2)
-rmin = lambda x: np.min(x).round(2)
-rmax = lambda x: np.max(x).round(2)
+
+rmean = lambda x: np.nanmean(x).round(2)
+rstd = lambda x: np.nanstd(x).round(2)
+rmin = lambda x: np.min(np.where(np.isnan(x), np.inf, x)).round(2)
+rmax = lambda x: np.max(np.where(np.isnan(x), np.inf, x)).round(2)
 
 gstats.register("avg", rmean)
 gstats.register("std", rstd)
@@ -97,7 +81,7 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
         :return: int, type casted and checked output
         '''
         x: int = int(num)
-        if x > 17 or x < 1:
+        if x > 90 or x < 1:
             raise parser.error(f"max_tl must be between 1 and 17, passed value: {x}")
         return x
 
@@ -191,9 +175,9 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
 
     parser.add_argument('--max_tl',
                         help='The maximum height of the tree to construct for gp.PrimitiveTree.\
-                        \n Default is 11, Maximum is 17.',
+                        \n Default is 15, Maximum is 91.',
                         type=type_max_tl,
-                        default=11)
+                        default=15)
 
     parser.add_argument('--algorithm',
                         type=str,
@@ -201,6 +185,13 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
                         \n"mupluslambda" for eaMuPlusLambda.\n Default is "simple".',
                         default='simple',
                         choices=['simple', 'mupluslambda'])
+
+    parser.add_argument('--loss',
+                        type=str,
+                        help='Choice of Objective Function, options are "acc" for accuracy'\
+                             '\n and "ce" for Binary Cross Entropy Loss.\n Default is "ce".',
+                        default='ce',
+                        choices=['acc', 'ce'])
 
     parser.add_argument('--verbose',
                         help='output verbosity.\
@@ -284,14 +275,41 @@ def parse_args() -> Tuple[dict, object, int, str, argparse.Namespace]:
         algo_tag: str = 'eaMuPlusLambda'
 
     data: object= GAData(filepath=ret_args.data, do_norm=ret_args.normalize)
-    max_tl: int = ret_args.max_tl
 
     print(f'Running GA with: {algo_tag}')
-    return taskdict, data, max_tl, algo_tag, ret_args
+    if ret_args.max_tl > 17:
+        print(f'Running GP with Extra Long Trees, Watch out for bloat (!)')
+
+    return taskdict, data, algo_tag, ret_args
 
 
+workdict, g_data, tag, args = parse_args()
 
-workdict, g_data, g_max_tl, tag, args = parse_args()
+g_max_tl: int = args.max_tl
+
+
+@njit(fastmath=True, nogil=True, parallel=True)
+def accuracy_score(ytrue: np.ndarray, yhat: np.ndarray) -> np.float32:
+    ysig = (1e-15 + (1 / (1 + np.exp(-yhat)))) > 0.5
+    return np.float32(np.sum(ytrue == ysig))
+
+
+@njit(fastmath=True, nogil=True, parallel=True)
+def nbnp_ce(ytrue, yhat):
+    ysig = np.where(yhat >= 0, 1 / (1 + np.exp(-yhat)), np.exp(yhat) / (1 + np.exp(yhat)))
+    return -1/len(ytrue) * (np.sum(ytrue*np.log(ysig) + (1-ytrue)*np.log(1-ysig)))
+
+
+if args.loss == 'ce':
+    lossfn = nbnp_ce
+    # creator classes
+    gcreator.create('FitnessMIN', base.Fitness, weights=(-1.0,))
+    gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMIN)
+else:
+    lossfn = accuracy_score
+    # creator classes
+    gcreator.create('FitnessMAX', base.Fitness, weights=(1.0,))
+    gcreator.create('Individual', gp.PrimitiveTree, fitness=gcreator.FitnessMAX)
 
 
 def getpset(pset_data: object = g_data):
@@ -300,18 +318,59 @@ def getpset(pset_data: object = g_data):
     :param pset_data: object, GAData, for renaming of args in accordance with training data features.
     :return: gp.PrimitiveSet, set of primitives to consider for future symbolic operations in GA.
     '''
-    p_set = gp.PrimitiveSet('MAIN', arity=pset_data.numfeatures)
-    p_set.addPrimitive(np.add, arity=2)
-    p_set.addPrimitive(np.subtract, arity=2)
-    p_set.addPrimitive(np.multiply, arity=2)
-    p_set.addPrimitive(safediv, arity=2)
-    p_set.addPrimitive(np.negative, arity=1)
-    p_set.addPrimitive(np.tanh, arity=1)
-    p_set.addPrimitive(np.cos, arity=1)
-    p_set.addPrimitive(np.sin, arity=1)
-    p_set.addPrimitive(np.maximum, arity=2)
-    p_set.addPrimitive(np.minimum, arity=2)
-    p_set.addEphemeralConstant(f'rand', lambda: np.random.uniform(-1, 1))
+    p_set = gp.PrimitiveSetTyped('MAIN', tuple(repeat(float, g_data.numfeatures)), float)
+
+    # boolean ops
+    p_set.addPrimitive(np.logical_and, (bool, bool), bool)
+    p_set.addPrimitive(np.logical_or, (bool, bool), bool)
+    p_set.addPrimitive(np.logical_not, (bool,), bool)
+
+    # logical ops
+    # custom primitive
+    @njit([float32(boolean, float32, float32),
+           float64(boolean, float64, float64)],
+          nogil=True, parallel=True)
+    def ifte(input: bool, out1: float, out2: float) -> float:
+        if input:
+            return out1
+        else:
+            return out2
+
+    p_set.addPrimitive(np.less, (float, float), bool)
+    p_set.addPrimitive(np.equal, (float, float), bool)
+    p_set.addPrimitive(ifte, (float, float), bool)
+
+    # flops
+    # custom primitive
+    @njit([float32(float32, float32),
+           float64(float64, float64)],
+          nogil=True, parallel=True)
+    def safediv(l: float, r: float) -> float:
+        '''
+        zero protected division
+        :param l: float, int
+        :param r: float, int
+        :return: float
+        '''
+        if r == 0.0:
+            return 1
+        return l / r
+
+    p_set.addPrimitive(np.add, (float, float), float)
+    p_set.addPrimitive(np.subtract, (float, float), float)
+    p_set.addPrimitive(np.multiply, (float, float), float)
+    p_set.addPrimitive(safediv, (float, float), float)
+    p_set.addPrimitive(np.negative, (float,), float)
+    p_set.addPrimitive(np.tanh, (float,), float)
+    p_set.addPrimitive(np.cos, (float,), float)
+    p_set.addPrimitive(np.sin, (float,), float)
+    p_set.addPrimitive(np.maximum, (float, float), float)
+    p_set.addPrimitive(np.minimum, (float, float), float)
+
+    # terminals
+    p_set.addEphemeralConstant(f'rand', lambda: np.random.uniform(-1, 1), float)
+    p_set.addTerminal(False, bool)
+    p_set.addTerminal(True, bool)
     for cols in pset_data.c_args():
         p_set.renameArguments(**cols)
     return p_set
@@ -324,12 +383,6 @@ gtoolbox.register('population', tools.initRepeat, list, gtoolbox.individual)
 gtoolbox.register('compile', gp.compile, pset=g_pset)
 
 
-@njit(fastmath=True, nogil=True, parallel=True)
-def accuracy_score(ytrue: np.ndarray, yhat: np.ndarray) -> np.float32:
-    ysig = (1e-15 + (1 / (1 + np.exp(-yhat)))) > 0.5
-    return np.float32(np.sum(ytrue == ysig))
-
-
 @jit(nogil=True)
 def evaltree(individual: Callable) -> Tuple[np.float32]:
     '''
@@ -339,18 +392,20 @@ def evaltree(individual: Callable) -> Tuple[np.float32]:
     '''
     func = njit(fastmath=True, nogil=True, parallel=True)(gtoolbox.compile(expr=individual, pset=g_pset))
     funcmapped: np.ndarray = jmap(func, g_data.X_train)
-    retval = accuracy_score(g_data.Y_train, funcmapped)
+    retval = lossfn(g_data.Y_train, funcmapped)
     return retval,
 
 
 gtoolbox.register('evaluate', evaltree)
 gtoolbox.register('select', tools.selDoubleTournament, fitness_size=6, parsimony_size=1.6, fitness_first=True)
 gtoolbox.register('mate', gp.cxOnePoint)
-gtoolbox.register('expr_mut', gp.genFull, min_=0, max_=17)
+gtoolbox.register('expr_mut', gp.genFull, min_=0, max_=g_max_tl)
 gtoolbox.register('mutate', gp.mutUniform, expr=gtoolbox.expr_mut, pset=g_pset)
 
-gtoolbox.decorate('mate', gp.staticLimit(key=operator.attrgetter('height'), max_value=17))
-gtoolbox.decorate('mutate', gp.staticLimit(key=operator.attrgetter('height'), max_value=17))
+gtoolbox.decorate('mate', gp.staticLimit(key=operator.attrgetter('height'), max_value=g_max_tl))
+gtoolbox.decorate('mutate', gp.staticLimit(key=operator.attrgetter('height'), max_value=g_max_tl))
+gtoolbox.decorate('mate', gp.staticLimit(key=len, max_value=121*g_max_tl))
+gtoolbox.decorate('mutate', gp.staticLimit(key=len, max_value=121*g_max_tl))
 
 ghistory = tools.History()
 gtoolbox.decorate("mate", ghistory.decorator)
@@ -455,10 +510,10 @@ def append_savefile(filename: str, toappend: str='_saved_state') -> str:
 def main():
     # pool
     gc.collect()
-    pool = pt.multiprocessing.ProcessingPool(nodes=8)
+    pool = mp.ProcessingPool(nodes=8)
 
     # actual work
-    workdict['toolbox'].register('map', map)
+    workdict['toolbox'].register('map', pool.map)
     ghistory.update(workdict['population'])
     gc.collect()
     if tag == 'eaSimple':
